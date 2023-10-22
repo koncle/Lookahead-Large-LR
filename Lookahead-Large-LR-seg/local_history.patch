@@ -1,0 +1,190 @@
+Index: train.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/train.py b/train.py
+--- a/train.py	
++++ b/train.py	(date 1693273126876)
+@@ -10,7 +10,7 @@
+ 
+ from config import cfg, assert_and_infer_cfg
+ from param_utils import ParamOperator
+-from utils.misc import AverageMeter, prep_experiment, evaluate_eval, fast_hist
++from utils.misc import AverageMeter, prep_experiment, evaluate_eval, fast_hist, update_bn
+ import datasets
+ import loss
+ import network
+@@ -28,6 +28,9 @@
+ # Argument Parser
+ parser = argparse.ArgumentParser(description='Semantic Segmentation')
+ parser.add_argument('--LA', action='store_true', default=False, help='Lookahead')
++parser.add_argument('--regLA', action='store_true', default=False, help='Lookahead')
++parser.add_argument('--reg_strength', type=float, default=0.01, help='LA alpha')
++parser.add_argument('--avgLA', action='store_true', default=False, help='Lookahead')
+ parser.add_argument('--alpha', type=float, default=0.05, help='LA alpha')
+ parser.add_argument('--length', type=int, default=15, help='length')
+ parser.add_argument('--lr', type=float, default=0.01)
+@@ -268,29 +271,29 @@
+         if args.LA:
+             if args.local_rank == 0:
+                 print('updateBN')
+-            update_bn(train_loader, net, 200, device="cuda") # TODO : reset to the resnet statistics?
++            update_bn(train_loader, net, 200, device="cuda")
+             if args.local_rank == 0:
+                 print('update finished')
+ 
+-        # if args.local_rank == 0:
+-            # print("Saving pth file...")
+-            # evaluate_eval(args, net, optim, scheduler, None, None, [],
+-            #               writer, epoch, "None", None, i, save_pth=True)
++        if args.local_rank == 0:
++            print("Saving pth file...")
++            evaluate_eval(args, net, optim, scheduler, None, None, [], writer, epoch, "None", None, i, save_pth=True)
++
++        if epoch % 1 == 0:
++            # # Validation after epochs
++            # if len(val_loaders) == 1:
++            #     # Run validation only one time - To save models
++            #     for dataset, val_loader in val_loaders.items():
++            #         validate(val_loader, dataset, net, criterion_val, optim, scheduler, epoch, writer, i)
++            # else:
++            #     if args.local_rank == 0:
++            #         print("Saving pth file...")
++            #         evaluate_eval(args, net, optim, scheduler, None, None, [],
++            #                       writer, epoch, "None", None, i, save_pth=True)
+ 
+-        # Validation after epochs
+-        if len(val_loaders) == 1:
+-            # Run validation only one time - To save models
+-            for dataset, val_loader in val_loaders.items():
+-                validate(val_loader, dataset, net, criterion_val, optim, scheduler, epoch, writer, i)
+-        else:
+-            if args.local_rank == 0:
+-                print("Saving pth file...")
+-                evaluate_eval(args, net, optim, scheduler, None, None, [],
+-                              writer, epoch, "None", None, i, save_pth=True)
+-
+-        for dataset, val_loader in extra_val_loaders.items():
+-            print("Extra validating... This won't save pth file")
+-            validate(val_loader, dataset, net, criterion_val, optim, scheduler, epoch, writer, i, save_pth=False)
++            for dataset, val_loader in extra_val_loaders.items():
++                print("Extra validating... This won't save pth file")
++                validate(val_loader, dataset, net, criterion_val, optim, scheduler, epoch, writer, i, save_pth=False)
+ 
+         if args.class_uniform_pct:
+             if epoch >= args.max_cu_epoch:
+@@ -301,9 +304,6 @@
+ 
+         epoch += 1
+ 
+-    if args.LA:
+-        update_bn(train_loader, net, 200, device="cuda") # TODO : reset to the resnet statistics?
+-
+     # Validation after epochs
+     if len(val_loaders) == 1:
+         # Run validation only one time - To save models
+@@ -563,42 +563,6 @@
+         np.save(file_fullpath + file_name + file_name_post, feature_map)
+ 
+ 
+-@torch.no_grad()
+-def update_bn(iterator, model, n_steps, device="cuda"):
+-    return
+-    # model = model
+-    momenta = {}
+-    for module in model.modules():
+-        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+-            module.running_mean = torch.zeros_like(module.running_mean)
+-            module.running_var = torch.ones_like(module.running_var)
+-            momenta[module] = module.momentum
+-
+-    if not momenta:
+-        return
+-
+-    was_training = model.training
+-    model.train()
+-    for module in momenta.keys():
+-        module.momentum = None
+-        module.num_batches_tracked *= 0
+-
+-    print('Start update BN')
+-    train_iter = iter(iterator)
+-    for i in range(n_steps):
+-        print(i)
+-        data = next(train_iter)
+-        aux_gts, gts, inputs, batch_pixel_size = get_data(data)
+-        for di, (input, gt, aux_gt) in enumerate(zip(inputs, gts, aux_gts)):
+-            input, gt = input.cuda(), gt.cuda()
+-            model(input, gts=gt, aux_gts=aux_gt, img_gt=None, visualize=False)
+-
+-    for bn_module in momenta.keys():
+-        bn_module.momentum = momenta[bn_module]
+-    model.train(was_training)
+-    print('End update BN')
+-
+-
+ def lookahead_train(train_loader, net, optim, curr_epoch, writer, scheduler, max_iter):
+     net.train()
+ 
+@@ -616,8 +580,10 @@
+         if curr_iter >= max_iter:
+             break
+ 
++        mean_net = operator.extract_params(net).clone().detach()
+         init_param = operator.extract_params(net).clone()
+         for j in range(meta_length):
++            # print(j)
+             data = next(train_iter)
+             aux_gts, gts, inputs, batch_pixel_size = get_data(data)
+             for di, (input, gt, aux_gt) in enumerate(zip(inputs, gts, aux_gts)):
+@@ -627,12 +593,23 @@
+                 input, gt = input.cuda(), gt.cuda()
+                 optim.zero_grad()
+                 f_cor_arr, total_loss, wt_loss = forward_once(aux_gt, batch_pixel_size, curr_epoch, gt, input, net, train_total_loss)
++                if args.regLA:
++                    reg_loss = args.reg_strength * torch.mean((operator.extract_params(net) - mean_net) ** 2)
++                    total_loss += reg_loss
+                 total_loss.backward()
+                 optim.step()
+ 
+                 time_meter.update(time.time() - start_ts)
+                 curr_iter += 1
+-        final_param = operator.extract_params(net)
++                # moving average of network
++                mean_net = (mean_net * j + operator.extract_params(net).clone().detach()) / (j + 1)
++
++        # print(reg_loss)
++
++        if args.avgLA:
++            final_param = mean_net
++        else:
++            final_param = operator.extract_params(net)
+         inter_param = init_param * (1 - alpha) + final_param * alpha
+         operator.put_parameters(net, inter_param, data=True)
+         del init_param
+@@ -644,15 +621,15 @@
+         if i > 5 and args.test_mode:
+             return curr_iter
+ 
+-    train_iter = iter(train_loader)
+-    with torch.no_grad():
+-        for i in range(2): 
+-            for j in range(meta_length):
+-                data = next(train_iter)
+-                aux_gts, gts, inputs, batch_pixel_size = get_data(data)
+-                for di, (input, gt, aux_gt) in enumerate(zip(inputs, gts, aux_gts)):
+-                    input, gt = input.cuda(), gt.cuda()
+-                    f_cor_arr, total_loss, wt_loss = forward_once(aux_gt, batch_pixel_size, curr_epoch, gt, input, net, train_total_loss)
++    # train_iter = iter(train_loader)
++    # with torch.no_grad():
++    #     for i in range(2):
++    #         for j in range(meta_length):
++    #             data = next(train_iter)
++    #             aux_gts, gts, inputs, batch_pixel_size = get_data(data)
++    #             for di, (input, gt, aux_gt) in enumerate(zip(inputs, gts, aux_gts)):
++    #                 input, gt = input.cuda(), gt.cuda()
++    #                 f_cor_arr, total_loss, wt_loss = forward_once(aux_gt, batch_pixel_size, curr_epoch, gt, input, net, train_total_loss)
+ 
+     return curr_iter
+ 
